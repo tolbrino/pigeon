@@ -17,14 +17,15 @@ defmodule Pigeon.Mixfile do
   end
 
   def application do
-    [applications: [:logger, :httpoison],
-    mod: {Pigeon, []}]
+    [applications: [:logger, :httpoison, :gun],
+     mod: {Pigeon, []}]
   end
 
   defp deps do
     [{:poison, "~> 3.0"},
     {:httpoison, "~> 0.7"},
-    {:chatterbox, github: "joedevivo/chatterbox"},
+    {:gun, github: "ninenines/gun", ref: "23fc8e2"},
+    {:cowlib, github: "ninenines/cowlib", ref: "1fa875f", override: true},
     {:dogma, "~> 0.1", only: :dev},
     {:earmark, "~> 1.0", only: :dev},
     {:ex_doc, "~> 0.2", only: :dev},

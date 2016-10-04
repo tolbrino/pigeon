@@ -31,7 +31,6 @@ defmodule Pigeon.APNSWorker do
           apns_socket: socket,
           mode: mode,
           config: config,
-          stream_id: 1,
           queue: %{}
         }}
       {:error, :timeout} ->
@@ -64,25 +63,28 @@ defmodule Pigeon.APNSWorker do
   def connect_socket(_mode, _config, 3), do: {:error, :timeout}
   def connect_socket(mode, cert, key, tries) do
     uri = mode |> push_uri |> to_char_list
+    port = case Application.get_env(:pigeon, :apns_2197) do
+      true -> 2197
+      _ -> 443
+    end
     options = connect_socket_options(cert, key)
-    case :h2_client.start_link(:https, uri, options) do
+    case :gun.open(uri, port, options) do
       {:ok, socket} -> {:ok, socket}
       {:error, _} -> connect_socket(mode, cert, key, tries + 1)
     end
   end
 
   def connect_socket_options(cert, key) do
-    options = [cert,
-               key,
-               {:password, ''},
-               {:packet, 0},
-               {:reuseaddr, true},
-               {:active, true},
-               :binary]
-    case Application.get_env(:pigeon, :apns_2197) do
-      true -> options ++ [{:port, 2197}]
-      _ -> options
-    end
+    %{
+      trace: :false,
+      protocols: [:http2],
+      transport: :ssl,
+      transport_opts: [
+        cert,
+        key,
+        {:reuseaddr, true},
+      ],
+    }
   end
 
   def handle_cast(:stop, state), do: { :noreply, state }
@@ -96,19 +98,15 @@ defmodule Pigeon.APNSWorker do
   end
 
   def send_push(state, notification, on_response) do
-    %{apns_socket: socket, stream_id: stream_id, queue: queue} = state
+    %{apns_socket: socket, queue: queue} = state
     json = Pigeon.Notification.json_payload(notification.payload)
-    req_headers = [
-      {":method", "POST"},
-      {":path", "/3/device/#{notification.device_token}"},
-      {"content-length", "#{byte_size(json)}"}]
+    path = "/3/device/#{notification.device_token}"
+    req_headers = []
       |> put_apns_id(notification)
       |> put_apns_topic(notification)
-
-    :h2_client.send_request(socket, req_headers, json)
-    new_q = Map.put(queue, "#{stream_id}", {notification, on_response})
-    new_stream_id = stream_id + 2
-    { :noreply, %{state | stream_id: new_stream_id, queue: new_q } }
+    stream_ref = :gun.post(socket, path, req_headers, json)
+    new_q = Map.put(queue, stream_ref, {notification, on_response, nil, nil})
+    { :noreply, %{state | queue: new_q } }
   end
 
   defp put_apns_id(headers, notification) do
@@ -197,33 +195,39 @@ defmodule Pigeon.APNSWorker do
     end
   end
 
-  def handle_info({:END_STREAM, stream}, state) do
-    %{apns_socket: socket, queue: queue} = state
-
-    {:ok, {headers, body}} = :h2_client.get_response(socket, stream)
-    {notification, on_response} = queue["#{stream}"]
-
-    case get_status(headers) do
-      "200" ->
-        notification = %{notification | id: get_apns_id(headers)}
-        unless on_response == nil do on_response.({:ok, notification}) end
-        new_queue = Map.delete(queue, "#{stream}")
-        {:noreply, %{state | queue: new_queue}}
-      nil ->
-        {:noreply, state}
-      _error ->
-        reason = parse_error(body)
-        log_error(reason, notification)
-        unless on_response == nil do on_response.({:error, reason, notification}) end
-        new_queue = Map.delete(queue, "#{stream}")
-        {:noreply, %{state | queue: new_queue}}
-    end
+  def handle_info({:gun_response, _pid, stream_ref, fin, status, headers}, state) do
+    handle_data(state, stream_ref, fin, status, headers)
+  end
+  def handle_info({:gun_data, _pid, stream_ref, fin, data}, state) do
+    handle_data(state, stream_ref, fin, nil, nil, data)
+  end
+  def handle_info({:gun_up, _pid, :http2}, state) do
+    {:noreply, state}
   end
 
-  defp get_status(headers) do
-    case Enum.find(headers, fn({key, _val}) -> key == ":status" end) do
-      {":status", status} -> status
-      nil -> nil
+  def handle_data(%{queue: queue} = state, stream_ref, fin, status0, headers0, data \\ nil) do
+    {notification, on_response, status, headers} = case status0 do
+      nil ->
+        queue[stream_ref]
+      _ ->
+        {notification0, on_response0, _, _} = queue[stream_ref]
+        {notification0, on_response0, status0, headers0}
+    end
+    case status do
+      200 ->
+        notification = %{notification | id: get_apns_id(headers)}
+        unless on_response == nil do on_response.({:ok, notification}) end
+      _error ->
+        reason = parse_error(data)
+        log_error(reason, notification)
+        unless on_response == nil do on_response.({:error, reason, notification}) end
+    end
+    case fin do
+      :fin ->
+        new_queue = Map.delete(queue, stream_ref)
+        {:noreply, %{state | queue: new_queue}}
+      :nofin ->
+        {:noreply, state}
     end
   end
 
