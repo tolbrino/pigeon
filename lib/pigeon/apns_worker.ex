@@ -5,25 +5,32 @@ defmodule Pigeon.APNSWorker do
   use GenServer
   require Logger
 
-  defp apns_production_api_uri, do: "api.push.apple.com"
-  defp apns_development_api_uri, do: "api.development.push.apple.com"
+  alias Pigeon.{APNSConfig}
 
-  def push_uri(mode) do
-    case mode do
-      :dev -> apns_development_api_uri
-      :prod -> apns_production_api_uri
-    end
+  @apns_production_api_uri "api.push.apple.com"
+  @apns_development_api_uri "api.development.push.apple.com"
+
+  #
+  # EXTERNAL API
+  #
+
+  def start_link(service_id, config) do
+    GenServer.start_link(__MODULE__, config, name: {:global, {__MODULE__, service_id}})
   end
 
-  def start_link(name, config) do
-    GenServer.start_link(__MODULE__, {:ok, config}, name: name)
+  def push(service_id, notification) do
+    GenServer.cast({__MODULE__, service_id}, {:push, notification})
   end
 
-  def stop, do: :gen_server.cast(self, :stop)
+  def push(service_id, notification, on_response) do
+    GenServer.cast({__MODULE__, service_id}, {:push, notification, on_response})
+  end
 
-  def init({:ok, config}), do: initialize_worker(config)
+  #
+  # GenServer API
+  #
 
-  def initialize_worker(config) do
+  def init(config) do
     mode = config[:mode]
     case connect_socket(mode, config) do
       {:ok, socket} ->
@@ -34,67 +41,71 @@ defmodule Pigeon.APNSWorker do
           queue: %{}
         }}
       {:error, :timeout} ->
-        Logger.error """
-          Failed to establish SSL connection. Is the certificate signed for :#{mode} mode?
-          """
+        Logger.error ~s(Failed to establish SSL connection. Is the certificate signed for :#{mode} mode?)
         {:stop, {:error, :timeout}}
       {:error, :invalid_config} ->
-        Logger.error """
-          Invalid configuration.
-          """
+        Logger.error ~s(Invalid configuration.)
         {:stop, {:error, :invalid_config}}
     end
   end
 
-  def connect_socket(_mode, %{cert: nil, certfile: nil, key: _, keyfile: _}), do:
-    {:error, :invalid_config}
-  def connect_socket(_mode, %{cert: _, certfile: _, key: nil, keyfile: nil}), do:
-    {:error, :invalid_config}
-  def connect_socket(mode, %{cert: cert, certfile: nil, key: key, keyfile: nil}),
-    do: connect_socket(mode, {:cert, cert}, {:key, key}, 0)
-  def connect_socket(mode, %{cert: nil, certfile: certfile, key: key, keyfile: nil}),
-    do: connect_socket(mode, {:certfile, certfile}, {:key, key}, 0)
-  def connect_socket(mode, %{cert: nil, certfile: certfile, key: nil, keyfile: keyfile}),
-    do: connect_socket(mode, {:certfile, certfile}, {:keyfile, keyfile}, 0)
-  def connect_socket(mode, %{cert: cert, certfile: nil, key: nil, keyfile: keyfile}),
-    do: connect_socket(mode, {:cert, cert}, {:keyfile, keyfile}, 0)
-  def connect_socket(_mode, _), do: {:error, :invalid_config}
+  def handle_cast(:stop, state), do: { :noreply, state }
 
-  def connect_socket(_mode, _config, 3), do: {:error, :timeout}
-  def connect_socket(mode, cert, key, tries) do
+  def handle_cast({:push, notification}, state) do
+    send_push(state, notification, nil)
+  end
+
+  def handle_cast({:push, notification, on_response}, state) do
+    send_push(state, notification, on_response)
+  end
+
+  def handle_info({:gun_response, _pid, stream_ref, fin, status, headers}, state) do
+    handle_data(state, stream_ref, fin, status, headers)
+  end
+  def handle_info({:gun_data, _pid, stream_ref, fin, data}, state) do
+    handle_data(state, stream_ref, fin, nil, nil, data)
+  end
+  def handle_info({:gun_up, _pid, :http2}, state) do
+    {:noreply, state}
+  end
+
+  #
+  # INTERNAL FUNCTIONS
+  #
+
+  defp push_uri(mode) do
+    case mode do
+      :dev -> @apns_development_api_uri
+      :prod -> @apns_production_api_uri
+    end
+  end
+
+  defp connect_socket(_mode, %{cert: nil, certfile: nil, key: _, keyfile: _}), do:
+    {:error, :invalid_config}
+  defp connect_socket(_mode, %{cert: _, certfile: _, key: nil, keyfile: nil}), do:
+    {:error, :invalid_config}
+  defp connect_socket(mode, %{cert: cert, certfile: nil, key: key, keyfile: nil}),
+    do: connect_socket(mode, {:cert, cert}, {:key, key}, 0)
+  defp connect_socket(mode, %{cert: nil, certfile: certfile, key: key, keyfile: nil}),
+    do: connect_socket(mode, {:certfile, certfile}, {:key, key}, 0)
+  defp connect_socket(mode, %{cert: nil, certfile: certfile, key: nil, keyfile: keyfile}),
+    do: connect_socket(mode, {:certfile, certfile}, {:keyfile, keyfile}, 0)
+  defp connect_socket(mode, %{cert: cert, certfile: nil, key: nil, keyfile: keyfile}),
+    do: connect_socket(mode, {:cert, cert}, {:keyfile, keyfile}, 0)
+  defp connect_socket(_mode, _), do: {:error, :invalid_config}
+
+  defp connect_socket(_mode, _cert, _key, 3), do: {:error, :timeout}
+  defp connect_socket(mode, cert, key, tries) do
     uri = mode |> push_uri |> to_char_list
     port = case Application.get_env(:pigeon, :apns_2197) do
       true -> 2197
       _ -> 443
     end
-    options = connect_socket_options(cert, key)
+    options = APNSConfig.connect_socket_options(cert, key)
     case :gun.open(uri, port, options) do
       {:ok, socket} -> {:ok, socket}
       {:error, _} -> connect_socket(mode, cert, key, tries + 1)
     end
-  end
-
-  def connect_socket_options(cert, key) do
-    %{
-      trace: :false,
-      protocols: [:http2],
-      transport: :ssl,
-      transport_opts: [
-        cert,
-        key,
-        {:reuseaddr, true},
-      ],
-    }
-  end
-
-  def handle_cast(:stop, state), do: { :noreply, state }
-
-  def handle_cast({:push, :apns, notification}, state) do
-    send_push(state, notification, nil)
-  end
-
-  def handle_cast({:push, :apns, notification, on_response}, state) do
-    send_push(state, notification, on_response)
   end
 
   def send_push(state, notification, on_response) do
@@ -132,7 +143,7 @@ defmodule Pigeon.APNSWorker do
     Logger.error("#{reason}: #{error_msg(reason)}\n#{inspect(notification)}")
   end
 
-  def error_msg(error) do
+  defp error_msg(error) do
     case error do
       :payload_empty ->
         "The message payload was empty."
@@ -195,16 +206,6 @@ defmodule Pigeon.APNSWorker do
     end
   end
 
-  def handle_info({:gun_response, _pid, stream_ref, fin, status, headers}, state) do
-    handle_data(state, stream_ref, fin, status, headers)
-  end
-  def handle_info({:gun_data, _pid, stream_ref, fin, data}, state) do
-    handle_data(state, stream_ref, fin, nil, nil, data)
-  end
-  def handle_info({:gun_up, _pid, :http2}, state) do
-    {:noreply, state}
-  end
-
   def handle_data(%{queue: queue} = state, stream_ref, fin, status0, headers0, data \\ nil) do
     {notification, on_response, status, headers} = case status0 do
       nil ->
@@ -237,4 +238,5 @@ defmodule Pigeon.APNSWorker do
       nil -> nil
     end
   end
+
 end

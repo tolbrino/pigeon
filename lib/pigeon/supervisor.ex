@@ -5,28 +5,28 @@ defmodule Pigeon.Supervisor do
   use Supervisor
   require Logger
 
+  alias Pigeon.{APNSConfig}
+
+  #
+  # EXTERNAL API
+  #
+
   def start_link do
-    Supervisor.start_link(__MODULE__, :ok, name: :pigeon)
+    Supervisor.start_link(__MODULE__, :ok, name: __MODULE__)
   end
 
-  def stop, do: :gen_server.cast(:pigeon, :stop)
+  #
+  # Supervisor API
+  #
 
   def init(:ok) do
     children = apns_children ++ adm_children
     supervise(children, strategy: :one_for_one)
   end
 
-  defp apns_children do
-    cond do
-      !apns_keys? ->
-        []
-      valid_apns_config?(ssl_config) ->
-        [worker(Pigeon.APNSWorker, [:apns_worker, ssl_config], id: :apns_worker)]
-      true ->
-        Logger.error "Error starting :apns_worker. Invalid mode/cert/key configuration."
-        []
-    end
-  end
+  #
+  # INTERNAL FUNCTIONS
+  #
 
   defp adm_children do
     cond do
@@ -40,60 +40,38 @@ defmodule Pigeon.Supervisor do
     end
   end
 
-  defp config_mode, do: Application.get_env(:pigeon, :apns_mode)
-  defp config_cert, do: Application.get_env(:pigeon, :apns_cert)
-  defp config_key, do: Application.get_env(:pigeon, :apns_key)
+  defp apns_children do
+    Enum.reduce(config_apns(), [], fn(c, acc) ->
+      cond do
+        !apns_keys?(c) ->
+          acc
+        valid_apns_config?(APNSConfig.ssl_config(c)) ->
+          [worker(Pigeon.APNSWorker, [{:apns_worker, worker_id(c)}, APNSConfig.ssl_config(c)], id: worker_id(c)) | acc]
+        true ->
+          Logger.error ~s(Error reading :apns_worker #{worker_id(c)} configuration.
+                          Invalid mode/cert/key configuration.)
+          acc
+      end
+    end)
+  end
+
+  defp worker_id(config), do: Map.get(config, :id)
+
+  defp config_apns, do: Application.get_env(:pigeon, :apns, [])
 
   defp config_adm_client_id, do: Application.get_env(:pigeon, :adm_client_id)
   defp config_adm_client_secret, do: Application.get_env(:pigeon, :adm_client_secret)
 
-  def ssl_config do
-    %{
-      mode: config_mode,
-      cert: cert(config_cert),
-      certfile: file_path(config_cert),
-      key: key(config_key),
-      keyfile: file_path(config_key)
-    }
+
+  defp apns_keys?(config) do
+    mode = Map.get(config, :mode)
+    cert = Map.get(config, :cert)
+    key = Map.get(config, :key)
+    !is_nil(mode) && !is_nil(cert) && !is_nil(key)
   end
 
-  defp file_path(nil), do: nil
-  defp file_path(path) when is_binary(path) do
-    cond do
-      :filelib.is_file(path) -> Path.expand(path)
-      true -> nil
-    end
-  end
-  defp file_path({app_name, path}) when is_atom(app_name),
-    do: Path.expand(path, :code.priv_dir(app_name))
-
-  defp cert({_app_name, _path}), do: nil
-  defp cert(nil), do: nil
-  defp cert(bin) do
-    case :public_key.pem_decode(bin) do
-      [{:Certificate, cert, _}] -> cert
-      _ -> nil
-    end
-  end
-
-  defp key({_app_name, _path}), do: nil
-  defp key(nil), do: nil
-  defp key(bin) do
-    case :public_key.pem_decode(bin) do
-      [{:RSAPrivateKey, key, _}] -> {:RSAPrivateKey, key}
-      _ -> nil
-    end
-  end
-
-  def apns_keys? do
-    mode = Application.get_env(:pigeon, :apns_mode)
-    cert = Application.get_env(:pigeon, :apns_cert)
-    key = Application.get_env(:pigeon, :apns_key)
-    !is_nil(mode) and !is_nil(cert) and !is_nil(key)
-  end
-
-  def valid_apns_config?(config) do
-    valid_mode? = (config[:mode] == :dev or config[:mode] == :prod)
+  defp valid_apns_config?(config) do
+    valid_mode? = (config[:mode] == :dev || config[:mode] == :prod)
     valid_cert? = !is_nil(config[:cert] || config[:certfile])
     valid_key? = !is_nil(config[:key] || config[:keyfile])
     valid_mode? and valid_cert? and valid_key?
@@ -133,4 +111,5 @@ defmodule Pigeon.Supervisor do
     do: Logger.error "Unknown service #{service}"
 
   def handle_cast(:stop , state), do: { :noreply, state }
+
 end
