@@ -22,13 +22,15 @@ defmodule Pigeon.Mixfile do
   end
 
   defp deps do
-    [{:poison, "~> 3.0"},
-    {:httpoison, "~> 0.7"},
-    {:chatterbox, github: "joedevivo/chatterbox"},
-    {:dogma, "~> 0.1", only: :dev},
-    {:earmark, "~> 1.0", only: :dev},
-    {:ex_doc, "~> 0.2", only: :dev},
-    {:excoveralls, "~> 0.5", only: :test}]
+    [
+      {:poison, "~> 3.0"},
+      {:httpoison, "~> 0.7"},
+      {:chatterbox, github: "joedevivo/chatterbox"},
+      {:dogma, "~> 0.1", only: :dev},
+      {:earmark, "~> 1.0", only: :dev},
+      {:ex_doc, "~> 0.2", only: :dev},
+      {:excoveralls, "~> 0.5", only: :test},
+    ]
   end
 
   defp description do

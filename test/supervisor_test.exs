@@ -1,25 +1,21 @@
 defmodule Pigeon.SupervisorTest do
   use ExUnit.Case
 
-  alias Pigeon.Supervisor
-
-  describe "apns_keys?" do
-    test "returns true if env :apns_mode, :apns_cert, and :apns_key are set" do
-      assert Supervisor.apns_keys?
-    end
-
-    test "returns false if not set" do
-      mode = Application.get_env(:pigeon, :apns_mode)
-      Application.put_env(:pigeon, :apns_mode, nil)
-
-      refute Supervisor.apns_keys?
-
-      Application.put_env(:pigeon, :apns_mode, mode)
-    end
+  test "ensures supervisor starts all workers" do
+    config = Application.get_env(:pigeon, :apns)
+    assert length(config) == Supervisor.count_children(Pigeon.Supervisor).active
   end
 
-  test "valid_apns_config? returns true if proper ssl config keys present" do
-    assert Supervisor.valid_apns_config?(Supervisor.ssl_config)
+  test "ensures supervisor skips invalid configurations" do
+    :ok = Application.stop(:pigeon)
+    config = Application.get_env(:pigeon, :apns)
+    invalid_config = for c <- config, do: Map.put(c, :cert, nil)
+    :ok = Application.put_env(:pigeon, :apns, invalid_config)
+    :ok = Application.start(:pigeon)
+    assert Supervisor.count_children(Pigeon.Supervisor).active == 0
+    :ok = Application.stop(:pigeon)
+    :ok = Application.put_env(:pigeon, :apns, config)
+    :ok = Application.start(:pigeon)
   end
 
   describe "adm_configured?" do
@@ -40,4 +36,5 @@ defmodule Pigeon.SupervisorTest do
   test "valid_adm_config? returns true if proper Amazon ADM config keys present" do
     assert Supervisor.valid_adm_config?(Supervisor.adm_config)
   end
+
 end

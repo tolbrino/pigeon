@@ -7,12 +7,13 @@ defmodule Pigeon.APNS do
   @doc """
     Sends a push over APNS.
   """
-  @spec push(Pigeon.APNS.Notification) :: none
-  def push(notification), do: Pigeon.Supervisor.push(:apns, notification)
+  @spec push(term(), Pigeon.APNS.Notification) :: none
+  def push(service_id, notification), do: Pigeon.APNSWorker.push(service_id, notification)
 
   @doc """
     Sends a push over APNS.
   """
-  @spec push(Pigeon.APNS.Notification, (() -> none)) :: none
-  def push(notification, on_response), do: Pigeon.Supervisor.push(:apns, notification, on_response)
+  @spec push(term(), Pigeon.APNS.Notification, (() -> none)) :: none
+  def push(service_id, notification, on_response), do: Pigeon.APNSWorker.push(service_id, notification, on_response)
+
 end

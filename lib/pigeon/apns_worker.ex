@@ -5,25 +5,32 @@ defmodule Pigeon.APNSWorker do
   use GenServer
   require Logger
 
-  defp apns_production_api_uri, do: "api.push.apple.com"
-  defp apns_development_api_uri, do: "api.development.push.apple.com"
+  alias Pigeon.{APNSConfig}
 
-  def push_uri(mode) do
-    case mode do
-      :dev -> apns_development_api_uri
-      :prod -> apns_production_api_uri
-    end
+  @apns_production_api_uri "api.push.apple.com"
+  @apns_development_api_uri "api.development.push.apple.com"
+
+  #
+  # EXTERNAL API
+  #
+
+  def start_link(service_id, config) do
+    GenServer.start_link(__MODULE__, config, name: {:global, {__MODULE__, service_id}})
   end
 
-  def start_link(name, config) do
-    GenServer.start_link(__MODULE__, {:ok, config}, name: name)
+  def push(service_id, notification) do
+    GenServer.cast({__MODULE__, service_id}, {:push, notification})
   end
 
-  def stop, do: :gen_server.cast(self, :stop)
+  def push(service_id, notification, on_response) do
+    GenServer.cast({__MODULE__, service_id}, {:push, notification, on_response})
+  end
 
-  def init({:ok, config}), do: initialize_worker(config)
+  #
+  # GenServer API
+  #
 
-  def initialize_worker(config) do
+  def init(config) do
     mode = config[:mode]
     case connect_socket(mode, config) do
       {:ok, socket} ->
@@ -35,67 +42,83 @@ defmodule Pigeon.APNSWorker do
           queue: %{}
         }}
       {:error, :timeout} ->
-        Logger.error """
-          Failed to establish SSL connection. Is the certificate signed for :#{mode} mode?
-          """
+        Logger.error ~s(Failed to establish SSL connection. Is the certificate signed for :#{mode} mode?)
         {:stop, {:error, :timeout}}
       {:error, :invalid_config} ->
-        Logger.error """
-          Invalid configuration.
-          """
+        Logger.error ~s(Invalid configuration.)
         {:stop, {:error, :invalid_config}}
     end
   end
 
-  def connect_socket(_mode, %{cert: nil, certfile: nil, key: _, keyfile: _}), do:
-    {:error, :invalid_config}
-  def connect_socket(_mode, %{cert: _, certfile: _, key: nil, keyfile: nil}), do:
-    {:error, :invalid_config}
-  def connect_socket(mode, %{cert: cert, certfile: nil, key: key, keyfile: nil}),
-    do: connect_socket(mode, {:cert, cert}, {:key, key}, 0)
-  def connect_socket(mode, %{cert: nil, certfile: certfile, key: key, keyfile: nil}),
-    do: connect_socket(mode, {:certfile, certfile}, {:key, key}, 0)
-  def connect_socket(mode, %{cert: nil, certfile: certfile, key: nil, keyfile: keyfile}),
-    do: connect_socket(mode, {:certfile, certfile}, {:keyfile, keyfile}, 0)
-  def connect_socket(mode, %{cert: cert, certfile: nil, key: nil, keyfile: keyfile}),
-    do: connect_socket(mode, {:cert, cert}, {:keyfile, keyfile}, 0)
-  def connect_socket(_mode, _), do: {:error, :invalid_config}
+  def handle_cast(:stop, state), do: { :noreply, state }
 
-  def connect_socket(_mode, _config, 3), do: {:error, :timeout}
-  def connect_socket(mode, cert, key, tries) do
+  def handle_cast({:push, notification}, state) do
+    send_push(state, notification, nil)
+  end
+
+  def handle_cast({:push, notification, on_response}, state) do
+    send_push(state, notification, on_response)
+  end
+
+  def handle_info({:END_STREAM, stream}, state) do
+    %{apns_socket: socket, queue: queue} = state
+
+    {:ok, {headers, body}} = :h2_client.get_response(socket, stream)
+    {notification, on_response} = queue["#{stream}"]
+
+    case get_status(headers) do
+      "200" ->
+        notification = %{notification | id: get_apns_id(headers)}
+        unless on_response == nil do on_response.({:ok, notification}) end
+        new_queue = Map.delete(queue, "#{stream}")
+        {:noreply, %{state | queue: new_queue}}
+      nil ->
+        {:noreply, state}
+      _error ->
+        reason = parse_error(body)
+        log_error(reason, notification)
+        unless on_response == nil do on_response.({:error, reason, notification}) end
+        new_queue = Map.delete(queue, "#{stream}")
+        {:noreply, %{state | queue: new_queue}}
+    end
+  end
+
+  #
+  # INTERNAL FUNCTIONS
+  #
+
+  defp push_uri(mode) do
+    case mode do
+      :dev -> @apns_development_api_uri
+      :prod -> @apns_production_api_uri
+    end
+  end
+
+  defp connect_socket(_mode, %{cert: nil, certfile: nil, key: _, keyfile: _}), do:
+    {:error, :invalid_config}
+  defp connect_socket(_mode, %{cert: _, certfile: _, key: nil, keyfile: nil}), do:
+    {:error, :invalid_config}
+  defp connect_socket(mode, %{cert: cert, certfile: nil, key: key, keyfile: nil}),
+    do: connect_socket(mode, {:cert, cert}, {:key, key}, 0)
+  defp connect_socket(mode, %{cert: nil, certfile: certfile, key: key, keyfile: nil}),
+    do: connect_socket(mode, {:certfile, certfile}, {:key, key}, 0)
+  defp connect_socket(mode, %{cert: nil, certfile: certfile, key: nil, keyfile: keyfile}),
+    do: connect_socket(mode, {:certfile, certfile}, {:keyfile, keyfile}, 0)
+  defp connect_socket(mode, %{cert: cert, certfile: nil, key: nil, keyfile: keyfile}),
+    do: connect_socket(mode, {:cert, cert}, {:keyfile, keyfile}, 0)
+  defp connect_socket(_mode, _), do: {:error, :invalid_config}
+
+  defp connect_socket(_mode, _cert, _key, 3), do: {:error, :timeout}
+  defp connect_socket(mode, cert, key, tries) do
     uri = mode |> push_uri |> to_char_list
-    options = connect_socket_options(cert, key)
+    options = APNSConfig.connect_socket_options(cert, key)
     case :h2_client.start_link(:https, uri, options) do
       {:ok, socket} -> {:ok, socket}
       {:error, _} -> connect_socket(mode, cert, key, tries + 1)
     end
   end
 
-  def connect_socket_options(cert, key) do
-    options = [cert,
-               key,
-               {:password, ''},
-               {:packet, 0},
-               {:reuseaddr, true},
-               {:active, true},
-               :binary]
-    case Application.get_env(:pigeon, :apns_2197) do
-      true -> options ++ [{:port, 2197}]
-      _ -> options
-    end
-  end
-
-  def handle_cast(:stop, state), do: { :noreply, state }
-
-  def handle_cast({:push, :apns, notification}, state) do
-    send_push(state, notification, nil)
-  end
-
-  def handle_cast({:push, :apns, notification, on_response}, state) do
-    send_push(state, notification, on_response)
-  end
-
-  def send_push(state, notification, on_response) do
+  defp send_push(state, notification, on_response) do
     %{apns_socket: socket, stream_id: stream_id, queue: queue} = state
     json = Pigeon.Notification.json_payload(notification.payload)
     req_headers = [
@@ -134,7 +157,7 @@ defmodule Pigeon.APNSWorker do
     Logger.error("#{reason}: #{error_msg(reason)}\n#{inspect(notification)}")
   end
 
-  def error_msg(error) do
+  defp error_msg(error) do
     case error do
       :payload_empty ->
         "The message payload was empty."
@@ -197,29 +220,6 @@ defmodule Pigeon.APNSWorker do
     end
   end
 
-  def handle_info({:END_STREAM, stream}, state) do
-    %{apns_socket: socket, queue: queue} = state
-
-    {:ok, {headers, body}} = :h2_client.get_response(socket, stream)
-    {notification, on_response} = queue["#{stream}"]
-
-    case get_status(headers) do
-      "200" ->
-        notification = %{notification | id: get_apns_id(headers)}
-        unless on_response == nil do on_response.({:ok, notification}) end
-        new_queue = Map.delete(queue, "#{stream}")
-        {:noreply, %{state | queue: new_queue}}
-      nil ->
-        {:noreply, state}
-      _error ->
-        reason = parse_error(body)
-        log_error(reason, notification)
-        unless on_response == nil do on_response.({:error, reason, notification}) end
-        new_queue = Map.delete(queue, "#{stream}")
-        {:noreply, %{state | queue: new_queue}}
-    end
-  end
-
   defp get_status(headers) do
     case Enum.find(headers, fn({key, _val}) -> key == ":status" end) do
       {":status", status} -> status
@@ -233,4 +233,5 @@ defmodule Pigeon.APNSWorker do
       nil -> nil
     end
   end
+
 end
