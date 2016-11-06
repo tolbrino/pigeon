@@ -19,11 +19,11 @@ defmodule Pigeon.APNSWorker do
   end
 
   def push(service_id, notification) do
-    GenServer.cast({__MODULE__, service_id}, {:push, notification})
+    GenServer.cast({:gloabl, {__MODULE__, service_id}}, {:push, notification})
   end
 
   def push(service_id, notification, on_response) do
-    GenServer.cast({__MODULE__, service_id}, {:push, notification, on_response})
+    GenServer.cast({:global, {__MODULE__, service_id}}, {:push, notification, on_response})
   end
 
   #
