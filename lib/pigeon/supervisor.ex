@@ -46,7 +46,7 @@ defmodule Pigeon.Supervisor do
         !apns_keys?(c) ->
           acc
         valid_apns_config?(APNSConfig.ssl_config(c)) ->
-          [worker(Pigeon.APNSWorker, [{:apns_worker, worker_id(c)}, APNSConfig.ssl_config(c)], id: worker_id(c)) | acc]
+          [worker(Pigeon.APNSWorker, [worker_id(c), APNSConfig.ssl_config(c)], id: worker_id(c)) | acc]
         true ->
           Logger.error ~s(Error reading :apns_worker #{worker_id(c)} configuration.
                           Invalid mode/cert/key configuration.)
